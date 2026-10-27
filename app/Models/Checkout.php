@@ -41,6 +41,8 @@ use Illuminate\Support\Carbon;
  * @property string|null $reservation_id
  * @property Carbon|null $reservation_expires_at
  * @property string|null $payment_id
+ * @property string|null $payment_client_secret
+ * @property Carbon|null $payment_action_expires_at
  * @property string|null $order_id
  * @property int $step_attempts
  * @property Carbon|null $next_attempt_at
@@ -48,6 +50,8 @@ use Illuminate\Support\Carbon;
  * @property array<string, string>|null $trace_context
  * @property Carbon|null $closing_started_at
  * @property Carbon|null $close_cart_alerted_at
+ * @property Carbon|null $cart_unlocked_at
+ * @property Carbon|null $cart_unlock_alerted_at
  * @property int $version
  * @property Carbon|null $completed_at
  * @property Carbon|null $failed_at
@@ -117,6 +121,9 @@ final class Checkout extends Model
             'trace_context' => 'array',
             'closing_started_at' => 'datetime',
             'close_cart_alerted_at' => 'datetime',
+            'payment_action_expires_at' => 'datetime',
+            'cart_unlocked_at' => 'datetime',
+            'cart_unlock_alerted_at' => 'datetime',
             'version' => 'integer',
             'completed_at' => 'datetime',
             'failed_at' => 'datetime',

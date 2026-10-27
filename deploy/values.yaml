@@ -9,11 +9,13 @@ consumers:
       - inventory.reservation-failed
       - inventory.reservation-committed
       - inventory.reservation-released
+      - payments.payment-requires-action
       - payments.payment-succeeded
       - payments.payment-failed
       - payments.refunded
       - orders.order-placed
       - orders.order-rejected
+      - orders.order-cancelled
 scheduler:
   # Outbox relay (every second) and checkout:time-out-steps (every 10 s).
   enabled: true

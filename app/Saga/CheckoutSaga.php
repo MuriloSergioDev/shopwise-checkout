@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Saga;
 
+use App\Actions\UnlockCheckoutCart;
 use App\Enums\CheckoutStatus;
 use App\Enums\FailureReason;
 use App\Enums\SagaStep;
@@ -22,8 +23,8 @@ use Shopwise\Kit\Messaging\Envelope;
  * only logged), changes the row with an optimistic lock and records the next command in the outbox, so the state
  * and the message commit together.
  *
- * Forward: reserving → paying → committing_stock → placing_order → closing_cart → completed.
- * Any failure: compensating (undo commands in flight, in waves) → failed.
+ * Forward: reserving → paying (→ awaiting_payment_action) → committing_stock → placing_order → closing_cart →
+ * completed. Any failure: compensating (undo commands in flight, in waves) → failed, which then unlocks the cart.
  */
 final readonly class CheckoutSaga
 {
@@ -83,13 +84,47 @@ final readonly class CheckoutSaga
         $this->compensate($checkout, FailureReason::OutOfStock, []);
     }
 
-    public function paymentSucceeded(Checkout $checkout, Envelope $reply, string $paymentId): void
+    /**
+     * 3-D Secure: the card needs the customer. The step now waits until the action expires (payments then answers
+     * payment-failed timeout) plus a grace period before it re-sends request-payment. A re-published one while
+     * already waiting changes nothing.
+     */
+    public function paymentRequiresAction(Checkout $checkout, Envelope $reply, string $paymentId, string $clientSecret, Carbon $expiresAt): void
     {
         $this->assertInTransaction();
 
         if ($checkout->status === CheckoutStatus::Paying) {
+            $this->log($checkout, SagaStep::RequestPayment, StepOutcome::Replied, $reply, ['paymentId' => $paymentId, 'requiresAction' => true, 'expiresAt' => $expiresAt->toIso8601ZuluString()]);
+            $checkout->payment_id = $paymentId;
+            $checkout->payment_client_secret = $clientSecret;
+            $checkout->payment_action_expires_at = $expiresAt;
+            $checkout->status = CheckoutStatus::AwaitingPaymentAction;
+            $checkout->step_attempts = 1;
+            $checkout->next_attempt_at = $expiresAt->copy()->addSeconds(config()->integer('checkout.payment_action_grace_seconds'));
+            $checkout->saveVersioned();
+
+            return;
+        }
+
+        if ($checkout->status === CheckoutStatus::Compensating || $checkout->status === CheckoutStatus::Failed) {
+            // An intent still waiting for the customer after we gave up: refund-payment cancels it.
+            $checkout->payment_id ??= $paymentId;
+            $this->undoLateSuccess($checkout, SagaStep::RefundPayment, $reply);
+
+            return;
+        }
+
+        $this->ignore($checkout, SagaStep::RequestPayment, $reply);
+    }
+
+    public function paymentSucceeded(Checkout $checkout, Envelope $reply, string $paymentId): void
+    {
+        $this->assertInTransaction();
+
+        if ($this->isPaying($checkout)) {
             $this->log($checkout, SagaStep::RequestPayment, StepOutcome::Replied, $reply, ['paymentId' => $paymentId]);
             $checkout->payment_id = $paymentId;
+            $this->clearPaymentAction($checkout);
             $this->advance($checkout, CheckoutStatus::CommittingStock);
 
             return;
@@ -113,7 +148,7 @@ final readonly class CheckoutSaga
     {
         $this->assertInTransaction();
 
-        if ($checkout->status === CheckoutStatus::Paying) {
+        if ($this->isPaying($checkout)) {
             $this->log($checkout, SagaStep::RequestPayment, StepOutcome::Failed, $reply, ['reason' => $reason]);
             $checkout->payment_failure_reason = $reason;
             $checkout->payment_failure_message = $message;
@@ -125,9 +160,20 @@ final readonly class CheckoutSaga
         $this->undoConfirmed($checkout, SagaStep::RefundPayment, $reply);
     }
 
-    public function refunded(Checkout $checkout, Envelope $reply): void
+    /**
+     * A refund checkout asked for confirms the undo; one made outside the saga (`external`, from the Stripe
+     * dashboard) is none of the saga's business.
+     */
+    public function refunded(Checkout $checkout, Envelope $reply, string $reason): void
     {
         $this->assertInTransaction();
+
+        if ($reason === 'external') {
+            $this->log($checkout, SagaStep::RefundPayment, StepOutcome::Ignored, $reply, ['status' => $checkout->status->value, 'reason' => $reason]);
+
+            return;
+        }
+
         $this->undoConfirmed($checkout, SagaStep::RefundPayment, $reply);
     }
 
@@ -181,8 +227,15 @@ final readonly class CheckoutSaga
             return;
         }
 
+        if ($this->hasCompensation($checkout, SagaStep::CancelOrder)) {
+            // The order step timed out and cancel-order is in flight (or done): orders cancels this order too.
+            $this->log($checkout, SagaStep::PlaceOrder, StepOutcome::Ignored, $reply, ['orderId' => $orderId, 'late' => true]);
+
+            return;
+        }
+
         if ($checkout->status === CheckoutStatus::Compensating || $checkout->status === CheckoutStatus::Failed) {
-            // Orders cannot cancel an order yet; the refund and release already in flight undo the money and stock.
+            // Not an order this saga is cancelling; the refund and release already in flight undo the money and stock.
             Log::error('Order placed for a checkout that is being undone', ['checkoutId' => $checkout->id, 'orderId' => $orderId]);
             $this->log($checkout, SagaStep::PlaceOrder, StepOutcome::Ignored, $reply, ['orderId' => $orderId, 'late' => true]);
             $checkout->order_id ??= $orderId;
@@ -198,14 +251,29 @@ final readonly class CheckoutSaga
     {
         $this->assertInTransaction();
 
-        if ($checkout->status !== CheckoutStatus::PlacingOrder) {
-            $this->ignore($checkout, SagaStep::PlaceOrder, $reply);
+        // `cancelled` answers a place-order that arrived after our own cancel-order: the undo is already in flight.
+        if ($checkout->status !== CheckoutStatus::PlacingOrder || $reason === 'cancelled') {
+            $this->log($checkout, SagaStep::PlaceOrder, StepOutcome::Ignored, $reply, ['status' => $checkout->status->value, 'reason' => $reason]);
 
             return;
         }
 
         $this->log($checkout, SagaStep::PlaceOrder, StepOutcome::Failed, $reply, ['reason' => $reason, 'message' => $message]);
         $this->compensate($checkout, FailureReason::OrderRejected, [[SagaStep::RefundPayment, SagaStep::ReleaseReservation]]);
+    }
+
+    /**
+     * The reply to cancel-order: the checkout has no live order any more (orderId is null when none was placed).
+     */
+    public function orderCancelled(Checkout $checkout, Envelope $reply, ?string $orderId): void
+    {
+        $this->assertInTransaction();
+
+        if ($orderId !== null) {
+            Log::info('Late order cancelled for a timed-out checkout', ['checkoutId' => $checkout->id, 'orderId' => $orderId]);
+        }
+
+        $this->undoConfirmed($checkout, SagaStep::CancelOrder, $reply);
     }
 
     /**
@@ -247,11 +315,53 @@ final readonly class CheckoutSaga
         $checkout->next_attempt_at = $this->closeCartRetryAt($checkout->step_attempts);
         $this->log($checkout, SagaStep::CloseCart, StepOutcome::Retrying, null, ['attempt' => $checkout->step_attempts, 'error' => $error]);
 
-        $alertAfter = config()->integer('checkout.close_cart_alert_after_seconds');
-        if ($checkout->close_cart_alerted_at === null
-            && $checkout->closing_started_at?->lessThanOrEqualTo(Carbon::now()->subSeconds($alertAfter)) === true) {
+        if ($checkout->close_cart_alerted_at === null && $this->overdue($checkout->closing_started_at)) {
             Log::error('Cart still not closed for a placed order', ['checkoutId' => $checkout->id, 'cartId' => $checkout->cart_id, 'attempts' => $checkout->step_attempts, 'error' => $error]);
             $checkout->close_cart_alerted_at = Carbon::now();
+        }
+
+        $checkout->saveVersioned();
+    }
+
+    /**
+     * The failed checkout's cart is unlocked (or cart refused for good, which no retry fixes): nothing is left to do.
+     */
+    public function cartUnlocked(Checkout $checkout, bool $unlockedByCart): void
+    {
+        $this->assertInTransaction();
+
+        if (! $this->isUnlockingCart($checkout)) {
+            return;
+        }
+
+        if (! $unlockedByCart) {
+            Log::error('Cart refused to unlock for a failed checkout', ['checkoutId' => $checkout->id, 'cartId' => $checkout->cart_id]);
+        }
+
+        $this->log($checkout, SagaStep::UnlockCart, $unlockedByCart ? StepOutcome::Replied : StepOutcome::Failed);
+        $checkout->cart_unlocked_at = Carbon::now();
+        $checkout->next_attempt_at = null;
+        $checkout->saveVersioned();
+    }
+
+    /**
+     * Unlocking failed in a way worth retrying: the same backoff and alert as closing the cart.
+     */
+    public function cartUnlockFailed(Checkout $checkout, string $error): void
+    {
+        $this->assertInTransaction();
+
+        if (! $this->isUnlockingCart($checkout)) {
+            return;
+        }
+
+        $checkout->step_attempts++;
+        $checkout->next_attempt_at = $this->closeCartRetryAt($checkout->step_attempts);
+        $this->log($checkout, SagaStep::UnlockCart, StepOutcome::Retrying, null, ['attempt' => $checkout->step_attempts, 'error' => $error]);
+
+        if ($checkout->cart_unlock_alerted_at === null && $this->overdue($checkout->failed_at)) {
+            Log::error('Cart still locked by a failed checkout', ['checkoutId' => $checkout->id, 'cartId' => $checkout->cart_id, 'attempts' => $checkout->step_attempts, 'error' => $error]);
+            $checkout->cart_unlock_alerted_at = Carbon::now();
         }
 
         $checkout->saveVersioned();
@@ -295,9 +405,11 @@ final readonly class CheckoutSaga
             // Release is a no-op when nothing was reserved.
             CheckoutStatus::Reserving => [[SagaStep::ReleaseReservation]],
             // Refund first (it also cancels a PaymentIntent that is not final), then release.
-            CheckoutStatus::Paying => [[SagaStep::RefundPayment], [SagaStep::ReleaseReservation]],
-            // Not in ADR-0004's table: the stock may or may not be committed, so undo both (release covers both).
-            CheckoutStatus::CommittingStock, CheckoutStatus::PlacingOrder => [[SagaStep::RefundPayment, SagaStep::ReleaseReservation]],
+            CheckoutStatus::Paying, CheckoutStatus::AwaitingPaymentAction => [[SagaStep::RefundPayment], [SagaStep::ReleaseReservation]],
+            // The stock may or may not be committed: release returns committed stock too.
+            CheckoutStatus::CommittingStock => [[SagaStep::RefundPayment, SagaStep::ReleaseReservation]],
+            // The order may exist after all: cancel it so no order lives without its money and stock.
+            CheckoutStatus::PlacingOrder => [[SagaStep::CancelOrder, SagaStep::RefundPayment, SagaStep::ReleaseReservation]],
             default => throw new LogicException("No timeout compensation for {$checkout->status->value}."),
         });
     }
@@ -326,6 +438,7 @@ final readonly class CheckoutSaga
     {
         $checkout->failure_reason = $reason;
         $checkout->step_attempts = 0;
+        $this->clearPaymentAction($checkout);
 
         $compensations = [];
         foreach ($waves as $wave => $steps) {
@@ -443,14 +556,54 @@ final readonly class CheckoutSaga
         $this->log($checkout, $undo, StepOutcome::Resent, SagaMessages::command($checkout, $undo), ['reason' => 'late success']);
     }
 
+    /**
+     * Publishes checkout.failed and gives the cart back: UnlockCheckoutCart runs right after commit, and
+     * checkout:time-out-steps retries it from next_attempt_at (with the close-cart backoff) until cart answers.
+     */
     private function fail(Checkout $checkout): void
     {
         $checkout->status = CheckoutStatus::Failed;
         $checkout->failed_at = Carbon::now();
         $checkout->active_cart_id = null;
-        $checkout->next_attempt_at = null;
+        $checkout->step_attempts = 0;
+        $checkout->next_attempt_at = $this->closeCartRetryAt(1);
         $checkout->saveVersioned();
         $this->log($checkout, SagaStep::Finish, StepOutcome::Sent, SagaMessages::failed($checkout), ['reason' => $checkout->failure_reason?->value]);
+
+        $checkoutId = $checkout->id;
+        DB::afterCommit(fn () => app(UnlockCheckoutCart::class)->handle($checkoutId));
+    }
+
+    private function isPaying(Checkout $checkout): bool
+    {
+        return $checkout->status === CheckoutStatus::Paying || $checkout->status === CheckoutStatus::AwaitingPaymentAction;
+    }
+
+    /**
+     * The client secret is only kept while the customer can use it.
+     */
+    private function clearPaymentAction(Checkout $checkout): void
+    {
+        $checkout->payment_client_secret = null;
+        $checkout->payment_action_expires_at = null;
+    }
+
+    private function hasCompensation(Checkout $checkout, SagaStep $step): bool
+    {
+        return in_array($step->value, array_column($checkout->compensations ?? [], 'step'), true);
+    }
+
+    private function isUnlockingCart(Checkout $checkout): bool
+    {
+        return $checkout->status === CheckoutStatus::Failed && $checkout->cart_unlocked_at === null;
+    }
+
+    /**
+     * Whether a retried REST step that started at $since has been failing for longer than the alert threshold.
+     */
+    private function overdue(?Carbon $since): bool
+    {
+        return $since?->lessThanOrEqualTo(Carbon::now()->subSeconds(config()->integer('checkout.close_cart_alert_after_seconds'))) === true;
     }
 
     private function ignore(Checkout $checkout, SagaStep $step, Envelope $reply): void

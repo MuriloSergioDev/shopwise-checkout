@@ -6,6 +6,7 @@ use App\Enums\CheckoutStatus;
 use App\Models\Checkout;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Testing\TestResponse;
 use Shopwise\Kit\Messaging\OutboxMessage;
 
@@ -34,6 +35,8 @@ it('takes the snapshot and quote with the caller token, starts the saga and send
         ->assertJsonPath('data.lines.1.productName', null);
 
     Http::assertSent(fn (Request $request): bool => $request->url() === 'http://cart.test/api/carts/'.CART_ID.'/snapshot'
+        && $request->method() === 'POST'
+        && $request['checkoutId'] === $checkout->id
         && str_starts_with(bearerHeaderOf($request), 'Bearer '));
     Http::assertSent(fn (Request $request): bool => $request->url() === 'http://pricing.test/api/quotes'
         && $request['lines'] === [['sku' => 'TEE-MER-BLA-M', 'quantity' => 2], ['sku' => 'MUG-CER-WHI', 'quantity' => 1]]
@@ -113,7 +116,10 @@ it('rejects a cart that cannot be checked out with 422 and starts nothing', func
 
     postCheckout()->assertUnprocessable()->assertJsonValidationErrors($field);
 
-    expect(Checkout::query()->count())->toBe(0)->and(OutboxMessage::query()->count())->toBe(0);
+    expect(Checkout::query()->count())->toBe(0)
+        ->and(OutboxMessage::query()->count())->toBe(0)
+        ->and(unlockCalls())->toHaveCount(1)
+        ->and(unlockCalls()[0])->toBe(lockingCheckoutId());
 })->with([
     'empty cart' => fn (): array => [cartSnapshot([]), pricingQuote(), 'cartId'],
     'line no longer for sale' => fn (): array => [cartSnapshot([['sku' => 'OLD-1', 'quantity' => 1, 'productName' => null, 'variantName' => 'Old', 'available' => false]]), pricingQuote(), 'cartId'],
@@ -173,7 +179,7 @@ it('answers 503 when cart keeps failing, and opens the circuit after five failed
     expect(Checkout::query()->count())->toBe(0);
 });
 
-it('answers 503 when pricing times out', function (): void {
+it('answers 503 when pricing times out, and unlocks the cart again', function (): void {
     Http::fake([
         'cart.test/*' => Http::response(cartSnapshot()),
         'pricing.test/*' => Http::failedConnection(),
@@ -181,7 +187,54 @@ it('answers 503 when pricing times out', function (): void {
 
     postCheckout()->assertServiceUnavailable();
 
-    expect(Checkout::query()->count())->toBe(0);
+    expect(Checkout::query()->count())->toBe(0)
+        ->and(unlockCalls())->toBe([lockingCheckoutId()]);
+});
+
+/**
+ * The checkoutId the request locked the cart for.
+ */
+function lockingCheckoutId(): string
+{
+    $snapshot = Http::recorded(fn (Request $request): bool => str_ends_with($request->url(), '/snapshot'))->first();
+
+    return (string) $snapshot[0]['checkoutId'];
+}
+
+it('answers 409 when cart says another checkout holds the lock', function (): void {
+    Http::fake(['cart.test/*' => Http::response(['message' => 'Cart is locked.', 'code' => 'cart_locked', 'checkoutId' => '01JBCDEFGHJKMNPQRSTVWXYZ99'], 409)]);
+
+    postCheckout()->assertConflict();
+
+    expect(Checkout::query()->count())->toBe(0)
+        ->and(unlockCalls())->toBe([]);
+});
+
+it('unlocks the cart when the snapshot belongs to someone else', function (): void {
+    fakeServices(cartSnapshot(customerId: 'someone-else'));
+
+    postCheckout()->assertNotFound();
+
+    expect(unlockCalls())->toBe([lockingCheckoutId()]);
+});
+
+it('still answers 422 when the unlock after it fails, and logs the lock left behind', function (): void {
+    config(['services.cart.retries' => 0]);
+    fakeServices(cartSnapshot([]));
+    cartUnlockAnswers(fn () => Http::response([], 503));
+    Log::spy();
+
+    postCheckout()->assertUnprocessable();
+
+    Log::shouldHaveReceived('error')->withArgs(fn (string $message): bool => $message === 'Cart left locked by an aborted checkout start')->once();
+});
+
+it('keeps the lock for the saga when the checkout starts', function (): void {
+    fakeServices();
+
+    postCheckout()->assertAccepted();
+
+    expect(unlockCalls())->toBe([]);
 });
 
 it('sends the request trace context to cart, pricing and the outbox', function (): void {

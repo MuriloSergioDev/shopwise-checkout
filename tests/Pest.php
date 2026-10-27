@@ -7,6 +7,7 @@ use App\Models\Checkout;
 use Firebase\JWT\JWT;
 use Firebase\JWT\Key;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Shopwise\Kit\Auth\KeySource;
@@ -170,6 +171,7 @@ function fakeServices(?array $snapshot = null, ?array $quote = null): void
     Http::fake([
         'cart.test/api/carts/*/snapshot' => Http::response($snapshot ?? cartSnapshot()),
         'cart.test/internal/carts/*/checked-out' => fn () => app()->bound('test.cart-close') ? app('test.cart-close')() : Http::response(),
+        'cart.test/internal/carts/*/unlock' => fn () => app()->bound('test.cart-unlock') ? app('test.cart-unlock')() : Http::response(['data' => ['cartId' => CART_ID, 'lockedByCheckoutId' => null]]),
         'pricing.test/api/quotes' => Http::response($quote ?? pricingQuote()),
     ]);
 }
@@ -182,6 +184,29 @@ function fakeServices(?array $snapshot = null, ?array $quote = null): void
 function cartCloseAnswers(Closure $answer): void
 {
     app()->instance('test.cart-close', $answer);
+}
+
+/**
+ * Changes how the faked cart answers POST /internal/carts/{id}/unlock from now on.
+ *
+ * @param  Closure(): mixed  $answer
+ */
+function cartUnlockAnswers(Closure $answer): void
+{
+    app()->instance('test.cart-unlock', $answer);
+}
+
+/**
+ * The unlock calls cart received, as their checkoutIds.
+ *
+ * @return list<string>
+ */
+function unlockCalls(): array
+{
+    return Http::recorded(fn (Request $request): bool => str_ends_with($request->url(), '/unlock'))
+        ->map(fn (array $pair): string => (string) $pair[0]['checkoutId'])
+        ->values()
+        ->all();
 }
 
 /**

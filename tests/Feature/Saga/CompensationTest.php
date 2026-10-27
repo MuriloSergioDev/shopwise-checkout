@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 use App\Enums\CheckoutStatus;
 use App\Enums\FailureReason;
+use App\Enums\SagaStep;
+use App\Enums\StepOutcome;
 use App\Models\Checkout;
 
 function expectFailed(Checkout $checkout, FailureReason $reason): void
@@ -15,6 +17,8 @@ function expectFailed(Checkout $checkout, FailureReason $reason): void
         ->and($checkout->active_cart_id)->toBeNull()
         ->and($checkout->next_attempt_at)->toBeNull()
         ->and($checkout->failed_at)->not->toBeNull()
+        ->and($checkout->cart_unlocked_at)->not->toBeNull()
+        ->and(unlockCalls())->toBe([$checkout->id])
         ->and(outbox('checkout.failed'))->toHaveCount(1)
         ->and(outbox('checkout.failed')[0])->toMatchArray([
             'checkoutId' => $checkout->id,
@@ -144,15 +148,43 @@ it('refunds a payment that succeeds after the payment step timed out', function 
         ->and(outbox('inventory.commit-reservation'))->toBe([]);
 });
 
-it('keeps an order placed after its step timed out, and logs it, while the undo goes on', function (): void {
+it('sends customerId, amount and currency with every refund', function (): void {
     $checkout = checkoutIn(CheckoutStatus::PlacingOrder);
-    foreach (range(1, 4) as $pass) {
-        passDeadline(31);
-    }
 
-    reply($checkout, 'orders.order-placed.v1', ['orderId' => 'ORD-LATE']);
+    reply($checkout, 'orders.order-rejected.v1');
+
+    expect(outbox('payments.refund-payment')[0])->toMatchArray([
+        'checkoutId' => $checkout->id,
+        'customerId' => CUSTOMER_ID,
+        'amount' => 7300,
+        'currency' => 'USD',
+        'reason' => 'order_rejected',
+    ]);
+});
+
+it('ignores a refund made outside the saga', function (): void {
+    $checkout = checkoutIn(CheckoutStatus::PlacingOrder);
+    reply($checkout, 'orders.order-rejected.v1');
+    reply($checkout, 'inventory.reservation-released.v1', ['reason' => 'requested']);
+
+    reply($checkout, 'payments.refunded.v1', ['reason' => 'external']);
 
     expect($checkout->refresh()->status)->toBe(CheckoutStatus::Compensating)
-        ->and($checkout->order_id)->toBe('ORD-LATE')
-        ->and(outbox('checkout.completed'))->toBe([]);
+        ->and($checkout->steps()->where('outcome', StepOutcome::Ignored)->where('step', SagaStep::RefundPayment)->count())->toBe(1);
+
+    reply($checkout, 'payments.refunded.v1', ['reason' => 'order_rejected']);
+
+    expectFailed($checkout, FailureReason::OrderRejected);
+});
+
+it('ignores an external refund of a completed checkout', function (): void {
+    $checkout = checkoutIn(CheckoutStatus::PlacingOrder);
+    reply($checkout, 'orders.order-placed.v1');
+    expect($checkout->refresh()->status)->toBe(CheckoutStatus::Completed);
+
+    reply($checkout, 'payments.refunded.v1', ['reason' => 'external', 'amount' => 1000]);
+
+    expect($checkout->refresh()->status)->toBe(CheckoutStatus::Completed)
+        ->and(outbox('payments.refund-payment'))->toBe([])
+        ->and(outbox('checkout.failed'))->toBe([]);
 });

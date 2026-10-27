@@ -5,13 +5,15 @@ declare(strict_types=1);
 namespace App\Enums;
 
 /**
- * Where a checkout saga is (ADR-0004). Each forward state waits for the reply to one command;
+ * Where a checkout saga is (ADR-0004). Each forward state waits for the reply to one command
+ * (awaiting_payment_action waits on the same one as paying, while the customer does 3-D Secure);
  * completed and failed are final.
  */
 enum CheckoutStatus: string
 {
     case Reserving = 'reserving';
     case Paying = 'paying';
+    case AwaitingPaymentAction = 'awaiting_payment_action';
     case CommittingStock = 'committing_stock';
     case PlacingOrder = 'placing_order';
     case ClosingCart = 'closing_cart';
@@ -31,7 +33,7 @@ enum CheckoutStatus: string
     {
         return match ($this) {
             self::Reserving => SagaStep::ReserveStock,
-            self::Paying => SagaStep::RequestPayment,
+            self::Paying, self::AwaitingPaymentAction => SagaStep::RequestPayment,
             self::CommittingStock => SagaStep::CommitReservation,
             self::PlacingOrder => SagaStep::PlaceOrder,
             default => null,

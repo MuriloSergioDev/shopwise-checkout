@@ -2,9 +2,11 @@
 
 declare(strict_types=1);
 
+use App\Messaging\Handlers\OrderCancelledHandler;
 use App\Messaging\Handlers\OrderPlacedHandler;
 use App\Messaging\Handlers\OrderRejectedHandler;
 use App\Messaging\Handlers\PaymentFailedHandler;
+use App\Messaging\Handlers\PaymentRequiresActionHandler;
 use App\Messaging\Handlers\PaymentSucceededHandler;
 use App\Messaging\Handlers\RefundedHandler;
 use App\Messaging\Handlers\ReservationCommittedHandler;
@@ -24,11 +26,13 @@ return [
         'inventory.reservation-failed' => ReservationFailedHandler::class,
         'inventory.reservation-committed' => ReservationCommittedHandler::class,
         'inventory.reservation-released' => ReservationReleasedHandler::class,
+        'payments.payment-requires-action' => PaymentRequiresActionHandler::class,
         'payments.payment-succeeded' => PaymentSucceededHandler::class,
         'payments.payment-failed' => PaymentFailedHandler::class,
         'payments.refunded' => RefundedHandler::class,
         'orders.order-placed' => OrderPlacedHandler::class,
         'orders.order-rejected' => OrderRejectedHandler::class,
+        'orders.order-cancelled' => OrderCancelledHandler::class,
     ],
 
     'max_attempts' => 3,

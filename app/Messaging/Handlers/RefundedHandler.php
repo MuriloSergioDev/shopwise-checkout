@@ -12,7 +12,7 @@ use Shopwise\Kit\Messaging\Envelope;
 use Shopwise\Kit\Messaging\MessageHandler;
 
 /**
- * payments.refunded: a requested refund is confirmed.
+ * payments.refunded: a requested refund is confirmed (an `external` one is ignored).
  */
 final readonly class RefundedHandler implements MessageHandler
 {
@@ -24,7 +24,7 @@ final readonly class RefundedHandler implements MessageHandler
         $checkout = Reply::checkout($reply->checkoutId, $envelope);
 
         if ($checkout instanceof Checkout) {
-            $this->saga->refunded($checkout, $envelope);
+            $this->saga->refunded($checkout, $envelope, $reply->reason);
         }
     }
 }

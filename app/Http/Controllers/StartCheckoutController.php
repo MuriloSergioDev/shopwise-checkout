@@ -15,7 +15,7 @@ final class StartCheckoutController
     {
         $started = $startCheckout->handle($request->toData());
 
-        $response = CheckoutResource::make($started->checkout)->response();
+        $response = CheckoutResource::make($started->checkout)->forCustomer()->response();
 
         return $started->created
             ? $response->setStatusCode(202)->header('Location', "/api/checkouts/{$started->checkout->id}")

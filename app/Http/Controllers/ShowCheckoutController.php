@@ -24,6 +24,6 @@ final class ShowCheckoutController
             ->where('customer_id', $user->id)
             ->firstOrFail();
 
-        return CheckoutResource::make($checkout);
+        return CheckoutResource::make($checkout)->forCustomer();
     }
 }

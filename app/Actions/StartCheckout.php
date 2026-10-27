@@ -12,18 +12,23 @@ use App\Data\Quote;
 use App\Data\StartCheckoutData;
 use App\Data\StartedCheckout;
 use App\Enums\CheckoutStatus;
+use App\Exceptions\CartLocked;
+use App\Exceptions\DependencyUnavailable;
 use App\Models\Checkout;
 use App\Saga\CheckoutSaga;
 use App\Saga\SagaTrace;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\ValidationException;
 use Symfony\Component\HttpKernel\Exception\ConflictHttpException;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+use Throwable;
 
 /**
  * POST /api/checkouts: steps 1 and 2 of ADR-0004 run here, synchronously and with the caller's token, so a bad
- * cart or coupon is a plain 422 and no saga starts. Then the saga row and the first command commit together.
+ * cart or coupon is a plain 422 and no saga starts. Step 1 locks the cart for the new checkout id; whenever no saga
+ * starts after that, the cart is unlocked again. Then the saga row and the first command commit together.
  */
 final readonly class StartCheckout
 {
@@ -43,37 +48,91 @@ final readonly class StartCheckout
 
             $this->assertNoCheckoutInProgress($data->cartId);
 
-            $snapshot = $this->cart->snapshot($data->cartId, $data->bearerToken);
-            if (! $snapshot instanceof CartSnapshot || $snapshot->customerId !== $data->customerId) {
-                throw new NotFoundHttpException('Unknown cart.');
-            }
-
-            $this->assertCheckoutable($snapshot);
-
-            $stockLines = array_map(fn (CartSnapshotLine $line): array => ['sku' => $line->sku, 'quantity' => $line->quantity], $snapshot->lines);
-            $quote = $this->pricing->quote($stockLines, $snapshot->couponCode, $data->bearerToken);
-            $this->assertPriced($quote, $snapshot);
+            // The id exists before the saga row so step 1 can lock the cart for it.
+            $checkoutId = (new Checkout)->newUniqueId();
 
             try {
-                $checkout = DB::transaction(function () use ($data, $snapshot, $quote): Checkout {
-                    $this->assertNoCheckoutInProgress($data->cartId);
-                    $checkout = $this->create($data, $snapshot, $quote);
-                    $this->saga->begin($checkout);
-
-                    return $checkout;
-                });
-            } catch (UniqueConstraintViolationException) {
-                // A concurrent request won the race: the same key returns its checkout, another key is a conflict.
+                $snapshot = $this->cart->snapshot($data->cartId, $checkoutId, $data->bearerToken);
+            } catch (CartLocked) {
+                // A concurrent request with the same key may hold the lock for its own checkout.
                 $existing = $this->findByKey($data);
                 if ($existing instanceof Checkout) {
                     return new StartedCheckout($existing, false);
                 }
 
-                throw new ConflictHttpException('The cart already has a checkout in progress.');
+                throw new ConflictHttpException('The cart is locked by another checkout.');
+            }
+
+            if (! $snapshot instanceof CartSnapshot) {
+                throw new NotFoundHttpException('Unknown cart.');
+            }
+
+            try {
+                $checkout = $this->startSaga($checkoutId, $data, $snapshot);
+            } catch (Throwable $e) {
+                // No saga took over the lock (422, pricing down, a lost race): give the cart back right away.
+                $this->unlock($data->cartId, $checkoutId);
+
+                throw $e;
+            }
+
+            if (! $checkout instanceof Checkout) {
+                // A concurrent request with the same key created its checkout first.
+                $this->unlock($data->cartId, $checkoutId);
+
+                return new StartedCheckout($this->findByKey($data) ?? throw new ConflictHttpException('The cart already has a checkout in progress.'), false);
             }
 
             return new StartedCheckout($checkout, true);
         });
+    }
+
+    /**
+     * Steps 1 (checks) and 2, then the row and the first command in one transaction. Null when a concurrent request
+     * with the same Idempotency-Key created its checkout first.
+     */
+    private function startSaga(string $checkoutId, StartCheckoutData $data, CartSnapshot $snapshot): ?Checkout
+    {
+        if ($snapshot->customerId !== $data->customerId) {
+            throw new NotFoundHttpException('Unknown cart.');
+        }
+
+        $this->assertCheckoutable($snapshot);
+
+        $stockLines = array_map(fn (CartSnapshotLine $line): array => ['sku' => $line->sku, 'quantity' => $line->quantity], $snapshot->lines);
+        $quote = $this->pricing->quote($stockLines, $snapshot->couponCode, $data->bearerToken);
+        $this->assertPriced($quote, $snapshot);
+
+        try {
+            return DB::transaction(function () use ($checkoutId, $data, $snapshot, $quote): Checkout {
+                $this->assertNoCheckoutInProgress($data->cartId);
+                $checkout = $this->create($checkoutId, $data, $snapshot, $quote);
+                $this->saga->begin($checkout);
+
+                return $checkout;
+            });
+        } catch (UniqueConstraintViolationException $e) {
+            // A concurrent request won the race: the same key returns its checkout, another key is a conflict.
+            if ($this->findByKey($data) instanceof Checkout) {
+                return null;
+            }
+
+            throw new ConflictHttpException('The cart already has a checkout in progress.', $e);
+        }
+    }
+
+    /**
+     * Best effort: a lock left behind keeps the cart read-only until someone unlocks it, so it is logged loudly.
+     */
+    private function unlock(string $cartId, string $checkoutId): void
+    {
+        try {
+            if (! $this->cart->unlock($cartId, $checkoutId)) {
+                Log::warning('Cart refused to unlock after an aborted checkout start', ['cartId' => $cartId, 'checkoutId' => $checkoutId]);
+            }
+        } catch (DependencyUnavailable $e) {
+            Log::error('Cart left locked by an aborted checkout start', ['cartId' => $cartId, 'checkoutId' => $checkoutId, 'error' => $e->getMessage()]);
+        }
     }
 
     private function findByKey(StartCheckoutData $data): ?Checkout
@@ -128,7 +187,7 @@ final readonly class StartCheckout
         }
     }
 
-    private function create(StartCheckoutData $data, CartSnapshot $snapshot, Quote $quote): Checkout
+    private function create(string $checkoutId, StartCheckoutData $data, CartSnapshot $snapshot, Quote $quote): Checkout
     {
         $lines = array_map(fn (CartSnapshotLine $line): array => [
             'sku' => $line->sku,
@@ -140,6 +199,7 @@ final readonly class StartCheckout
         ], $snapshot->lines);
 
         return Checkout::query()->create([
+            'id' => $checkoutId,
             'customer_id' => $data->customerId,
             'customer_email' => $data->customerEmail,
             'idempotency_key' => $data->idempotencyKey,

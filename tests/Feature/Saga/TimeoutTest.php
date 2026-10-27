@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use App\Enums\CheckoutStatus;
 use App\Enums\FailureReason;
+use App\Enums\SagaStep;
 use App\Enums\StepOutcome;
 use Shopwise\Kit\Messaging\OutboxMessage;
 
@@ -86,7 +87,7 @@ it('refunds and releases when the commit step times out', function (): void {
         ->and(outbox('inventory.release-reservation'))->toHaveCount(1);
 });
 
-it('refunds and releases when the order step times out', function (): void {
+it('cancels the order, refunds and releases when the order step times out', function (): void {
     $checkout = checkoutIn(CheckoutStatus::PlacingOrder);
 
     timeOutCurrentStep();
@@ -94,14 +95,68 @@ it('refunds and releases when the order step times out', function (): void {
     expect($checkout->refresh()->status)->toBe(CheckoutStatus::Compensating)
         ->and($checkout->failure_reason)->toBe(FailureReason::Timeout)
         ->and(outbox('orders.place-order'))->toHaveCount(4)
+        ->and(outbox('orders.cancel-order'))->toHaveCount(1)
+        ->and(outbox('orders.cancel-order')[0])->toMatchArray(['checkoutId' => $checkout->id, 'reason' => 'timeout'])
         ->and(outbox('payments.refund-payment'))->toHaveCount(1)
         ->and(outbox('inventory.release-reservation'))->toHaveCount(1);
 
     reply($checkout, 'payments.refunded.v1', ['reason' => 'timeout']);
     reply($checkout, 'inventory.reservation-released.v1');
+    expect($checkout->refresh()->status)->toBe(CheckoutStatus::Compensating);
+
+    reply($checkout, 'orders.order-cancelled.v1', ['orderId' => null, 'number' => null, 'customerId' => null, 'email' => null]);
+
+    expect($checkout->refresh()->status)->toBe(CheckoutStatus::Failed)
+        ->and($checkout->order_id)->toBeNull()
+        ->and(outbox('checkout.failed')[0]['reason'])->toBe('timeout');
+});
+
+it('re-sends cancel-order until orders confirms it', function (): void {
+    $checkout = checkoutIn(CheckoutStatus::PlacingOrder);
+    timeOutCurrentStep();
+    reply($checkout, 'payments.refunded.v1', ['reason' => 'timeout']);
+    reply($checkout, 'inventory.reservation-released.v1');
+
+    passDeadline(31);
+
+    expect(outbox('orders.cancel-order'))->toHaveCount(2)
+        ->and(outbox('payments.refund-payment'))->toHaveCount(1)
+        ->and(outbox('inventory.release-reservation'))->toHaveCount(1);
+});
+
+it('ignores a late order-placed or a cancelled rejection while the cancel is in flight', function (): void {
+    $checkout = checkoutIn(CheckoutStatus::PlacingOrder);
+    timeOutCurrentStep();
+
+    reply($checkout, 'orders.order-placed.v1', ['orderId' => 'ORD-LATE']);
+    reply($checkout, 'orders.order-rejected.v1', ['reason' => 'cancelled']);
+
+    expect($checkout->refresh()->status)->toBe(CheckoutStatus::Compensating)
+        ->and($checkout->order_id)->toBeNull()
+        ->and(outbox('checkout.completed'))->toBe([])
+        ->and($checkout->steps()->where('step', SagaStep::PlaceOrder)->where('outcome', StepOutcome::Ignored)->count())->toBe(2);
+
+    reply($checkout, 'orders.order-cancelled.v1', ['orderId' => 'ORD-LATE']);
+    reply($checkout, 'payments.refunded.v1', ['reason' => 'timeout']);
+    reply($checkout, 'inventory.reservation-released.v1');
 
     expect($checkout->refresh()->status)->toBe(CheckoutStatus::Failed)
         ->and(outbox('checkout.failed')[0]['reason'])->toBe('timeout');
+});
+
+it('ignores order-cancelled outside a cancellation, and a redelivered one', function (): void {
+    $checkout = checkoutIn(CheckoutStatus::PlacingOrder);
+
+    reply($checkout, 'orders.order-cancelled.v1');
+    expect($checkout->refresh()->status)->toBe(CheckoutStatus::PlacingOrder);
+
+    timeOutCurrentStep();
+    $cancelled = reply($checkout, 'orders.order-cancelled.v1');
+    $version = $checkout->refresh()->version;
+    deliver($cancelled);
+
+    expect($checkout->refresh()->version)->toBe($version)
+        ->and($checkout->steps()->where('step', SagaStep::CancelOrder)->where('outcome', StepOutcome::Replied)->count())->toBe(1);
 });
 
 it('re-sends unconfirmed undo commands every 30 s three times, then every 5 minutes until they are confirmed', function (): void {

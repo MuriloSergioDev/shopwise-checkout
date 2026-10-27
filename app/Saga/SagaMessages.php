@@ -11,6 +11,7 @@ use LogicException;
 use Shopwise\Contracts\Commands\Inventory\CommitReservationV1;
 use Shopwise\Contracts\Commands\Inventory\ReleaseReservationV1;
 use Shopwise\Contracts\Commands\Inventory\ReserveStockV1;
+use Shopwise\Contracts\Commands\Orders\CancelOrderV1;
 use Shopwise\Contracts\Commands\Orders\PlaceOrderV1;
 use Shopwise\Contracts\Commands\Payments\RefundPaymentV1;
 use Shopwise\Contracts\Commands\Payments\RequestPaymentV1;
@@ -73,6 +74,15 @@ final class SagaMessages
             SagaStep::RefundPayment => new RefundPaymentV1(
                 checkoutId: $checkout->id,
                 reason: ($checkout->failure_reason ?? throw new LogicException('Refunding without a failure.'))->refundReason(),
+                requestedAt: $requestedAt,
+                // Payments refuses a refund whose values disagree with its payment.
+                customerId: $checkout->customer_id,
+                amount: $checkout->total,
+                currency: $checkout->currency,
+            ),
+            SagaStep::CancelOrder => new CancelOrderV1(
+                checkoutId: $checkout->id,
+                reason: 'timeout',
                 requestedAt: $requestedAt,
             ),
             default => throw new LogicException("Step {$step->value} has no command."),
