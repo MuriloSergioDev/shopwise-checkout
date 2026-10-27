@@ -1,0 +1,30 @@
+# Values for shopwise-platform/charts/laravel-service. `name` and `image` are set by the Tiltfile.
+http:
+  workers: 1
+# One consumer for every saga reply: every consumer shares the service's Kafka group id (checkout).
+consumers:
+  - name: replies
+    topics:
+      - inventory.stock-reserved
+      - inventory.reservation-failed
+      - inventory.reservation-committed
+      - inventory.reservation-released
+      - payments.payment-succeeded
+      - payments.payment-failed
+      - payments.refunded
+      - orders.order-placed
+      - orders.order-rejected
+scheduler:
+  # Outbox relay (every second) and checkout:time-out-steps (every 10 s).
+  enabled: true
+# Topics this service owns (it is the only producer). Command topics belong to their receivers' charts.
+topics:
+  - name: checkout.completed
+    partitions: 3
+  - name: checkout.failed
+    partitions: 3
+env:
+  LOG_CHANNEL: stderr
+  OCTANE_SERVER: frankenphp
+  CART_BASE_URL: http://cart:8000
+  PRICING_BASE_URL: http://pricing:8000
