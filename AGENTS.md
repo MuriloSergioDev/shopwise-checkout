@@ -29,7 +29,7 @@ cart into an order across inventory, payments and orders, and undoes what was do
 | `app/Saga/CheckoutSaga` | every transition; must run in a transaction; checks the expected state, saves with `saveVersioned()`, records the next command |
 | `app/Saga/SagaMessages` | builds commands/events from the row; the only place that calls `Outbox::record` |
 | `app/Saga/SagaTrace` | one checkout = one trace: request trace on start, stored trace for scheduler work |
-| `app/Messaging/Handlers` | one per reply type: read the payload (`App\Messaging\Reply`), call the saga |
+| `app/Messaging/Handlers` | one per reply type: parse it with its contract class, find the checkout (`App\Messaging\Reply`), call the saga |
 | `app/Actions/CloseCheckoutCart` | step 7 over REST, after commit; never compensated, retried with backoff |
 | `app/Actions/TimeOutCheckoutSteps` | the scheduler pass: resend, time out, resend undo commands, retry cart closing |
 | `app/Clients` | `ServiceClient` (timeouts, retry on connection errors/5xx, cache-backed circuit breaker, trace headers) |
@@ -56,7 +56,8 @@ Rules:
   the checkout completes anyway with an error logged.
 - `POST /api/checkouts`: same `Idempotency-Key` (per customer) → 200 with the existing checkout; another active
   checkout for the cart → 409 (`active_cart_id` is unique while a saga runs); cart/pricing unavailable → 503.
-- Payloads with nullable fields are built and read as arrays: the generated contract DTOs type them as non-null.
+- Every command, event and reply goes through its generated contract class (`Shopwise\Contracts\...V1`): built with
+  `new` + `toArray()` in `SagaMessages`, parsed with `fromArray()` in the handlers.
 
 ## Configuration
 `config/checkout.php` (saga timing) and `config/services.php` (`cart`, `pricing`, `http`). Env: `CART_BASE_URL`,

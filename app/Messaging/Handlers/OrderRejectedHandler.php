@@ -7,6 +7,7 @@ namespace App\Messaging\Handlers;
 use App\Messaging\Reply;
 use App\Models\Checkout;
 use App\Saga\CheckoutSaga;
+use Shopwise\Contracts\Events\Orders\OrderRejectedV1;
 use Shopwise\Kit\Messaging\Envelope;
 use Shopwise\Kit\Messaging\MessageHandler;
 
@@ -19,11 +20,11 @@ final readonly class OrderRejectedHandler implements MessageHandler
 
     public function handle(Envelope $envelope): void
     {
-        $reply = new Reply($envelope);
-        $checkout = $reply->checkout();
+        $reply = OrderRejectedV1::fromArray($envelope->data);
+        $checkout = Reply::checkout($reply->checkoutId, $envelope);
 
         if ($checkout instanceof Checkout) {
-            $this->saga->orderRejected($checkout, $envelope, $reply->string('reason'), $reply->nullableString('message'));
+            $this->saga->orderRejected($checkout, $envelope, $reply->reason, $reply->message);
         }
     }
 }

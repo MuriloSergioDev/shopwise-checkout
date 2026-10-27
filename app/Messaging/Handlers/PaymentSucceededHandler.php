@@ -7,6 +7,7 @@ namespace App\Messaging\Handlers;
 use App\Messaging\Reply;
 use App\Models\Checkout;
 use App\Saga\CheckoutSaga;
+use Shopwise\Contracts\Events\Payments\PaymentSucceededV1;
 use Shopwise\Kit\Messaging\Envelope;
 use Shopwise\Kit\Messaging\MessageHandler;
 
@@ -19,11 +20,11 @@ final readonly class PaymentSucceededHandler implements MessageHandler
 
     public function handle(Envelope $envelope): void
     {
-        $reply = new Reply($envelope);
-        $checkout = $reply->checkout();
+        $reply = PaymentSucceededV1::fromArray($envelope->data);
+        $checkout = Reply::checkout($reply->checkoutId, $envelope);
 
         if ($checkout instanceof Checkout) {
-            $this->saga->paymentSucceeded($checkout, $envelope, $reply->string('paymentId'));
+            $this->saga->paymentSucceeded($checkout, $envelope, $reply->paymentId);
         }
     }
 }

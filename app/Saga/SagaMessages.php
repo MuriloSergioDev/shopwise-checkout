@@ -20,9 +20,9 @@ use Shopwise\Kit\Messaging\Envelope;
 use Shopwise\Kit\Messaging\Outbox;
 
 /**
- * Builds the saga's outgoing messages from the checkout row and records them in the outbox (so they commit with
- * the state change). Commands are keyed by checkoutId; their topics and schemas belong to the receiver.
- * Payloads with nullable fields are built as arrays: the generated DTOs type them as non-null strings.
+ * Builds the saga's outgoing messages from the checkout row with the generated contract classes and records them in
+ * the outbox (so they commit with the state change). Commands are keyed by checkoutId; their topics and schemas
+ * belong to the receiver.
  */
 final class SagaMessages
 {
@@ -33,69 +33,71 @@ final class SagaMessages
     {
         $requestedAt = self::now();
 
-        [$type, $schema, $data] = match ($step) {
-            SagaStep::ReserveStock => [ReserveStockV1::TYPE, ReserveStockV1::SCHEMA, [
-                'checkoutId' => $checkout->id,
-                'lines' => self::stockLines($checkout),
-                'requestedAt' => $requestedAt,
-            ]],
-            SagaStep::RequestPayment => [RequestPaymentV1::TYPE, RequestPaymentV1::SCHEMA, [
-                'checkoutId' => $checkout->id,
-                'customerId' => $checkout->customer_id,
-                'amount' => $checkout->total,
-                'currency' => $checkout->currency,
-                'paymentMethodId' => $checkout->payment_method_id,
-                'requestedAt' => $requestedAt,
-            ]],
-            SagaStep::CommitReservation => [CommitReservationV1::TYPE, CommitReservationV1::SCHEMA, [
-                'checkoutId' => $checkout->id,
-                'reservationId' => $checkout->reservation_id ?? throw new LogicException('Committing without a reservation.'),
-                'requestedAt' => $requestedAt,
-            ]],
-            SagaStep::PlaceOrder => [PlaceOrderV1::TYPE, PlaceOrderV1::SCHEMA, [
-                'checkoutId' => $checkout->id,
-                'customerId' => $checkout->customer_id,
-                'email' => $checkout->customer_email,
-                'lines' => $checkout->lines,
-                'currency' => $checkout->currency,
-                'subtotal' => $checkout->subtotal,
-                'discount' => $checkout->discount,
-                'total' => $checkout->total,
-                'couponCode' => $checkout->coupon_code,
-                'paymentId' => $checkout->payment_id ?? throw new LogicException('Placing an order without a payment.'),
-                'shippingAddress' => $checkout->shipping_address,
-                'requestedAt' => $requestedAt,
-            ]],
-            SagaStep::ReleaseReservation => [ReleaseReservationV1::TYPE, ReleaseReservationV1::SCHEMA, [
-                'checkoutId' => $checkout->id,
-                'requestedAt' => $requestedAt,
-            ]],
-            SagaStep::RefundPayment => [RefundPaymentV1::TYPE, RefundPaymentV1::SCHEMA, [
-                'checkoutId' => $checkout->id,
-                'reason' => ($checkout->failure_reason ?? throw new LogicException('Refunding without a failure.'))->refundReason(),
-                'requestedAt' => $requestedAt,
-            ]],
+        $command = match ($step) {
+            SagaStep::ReserveStock => new ReserveStockV1(
+                checkoutId: $checkout->id,
+                lines: self::stockLines($checkout),
+                requestedAt: $requestedAt,
+            ),
+            SagaStep::RequestPayment => new RequestPaymentV1(
+                checkoutId: $checkout->id,
+                customerId: $checkout->customer_id,
+                amount: $checkout->total,
+                currency: $checkout->currency,
+                paymentMethodId: $checkout->payment_method_id,
+                requestedAt: $requestedAt,
+            ),
+            SagaStep::CommitReservation => new CommitReservationV1(
+                checkoutId: $checkout->id,
+                reservationId: $checkout->reservation_id ?? throw new LogicException('Committing without a reservation.'),
+                requestedAt: $requestedAt,
+            ),
+            SagaStep::PlaceOrder => new PlaceOrderV1(
+                checkoutId: $checkout->id,
+                customerId: $checkout->customer_id,
+                email: $checkout->customer_email,
+                lines: $checkout->lines,
+                currency: $checkout->currency,
+                subtotal: $checkout->subtotal,
+                discount: $checkout->discount,
+                total: $checkout->total,
+                couponCode: $checkout->coupon_code,
+                paymentId: $checkout->payment_id ?? throw new LogicException('Placing an order without a payment.'),
+                shippingAddress: $checkout->shipping_address,
+                requestedAt: $requestedAt,
+            ),
+            SagaStep::ReleaseReservation => new ReleaseReservationV1(
+                checkoutId: $checkout->id,
+                requestedAt: $requestedAt,
+            ),
+            SagaStep::RefundPayment => new RefundPaymentV1(
+                checkoutId: $checkout->id,
+                reason: ($checkout->failure_reason ?? throw new LogicException('Refunding without a failure.'))->refundReason(),
+                requestedAt: $requestedAt,
+            ),
             default => throw new LogicException("Step {$step->value} has no command."),
         };
 
-        return Outbox::record($type, $checkout->id, $data, $schema);
+        return Outbox::record($command::TYPE, $checkout->id, $command->toArray(), $command::SCHEMA);
     }
 
     public static function completed(Checkout $checkout): Envelope
     {
-        return Outbox::record(CompletedV1::TYPE, $checkout->id, [
-            'checkoutId' => $checkout->id,
-            'customerId' => $checkout->customer_id,
-            'cartId' => $checkout->cart_id,
-            'orderId' => $checkout->order_id ?? throw new LogicException('Completing without an order.'),
-            'paymentId' => $checkout->payment_id ?? throw new LogicException('Completing without a payment.'),
-            'currency' => $checkout->currency,
-            'subtotal' => $checkout->subtotal,
-            'discount' => $checkout->discount,
-            'total' => $checkout->total,
-            'couponCode' => $checkout->coupon_code,
-            'completedAt' => self::now(),
-        ], CompletedV1::SCHEMA);
+        $event = new CompletedV1(
+            checkoutId: $checkout->id,
+            customerId: $checkout->customer_id,
+            cartId: $checkout->cart_id,
+            orderId: $checkout->order_id ?? throw new LogicException('Completing without an order.'),
+            paymentId: $checkout->payment_id ?? throw new LogicException('Completing without a payment.'),
+            currency: $checkout->currency,
+            subtotal: $checkout->subtotal,
+            discount: $checkout->discount,
+            total: $checkout->total,
+            couponCode: $checkout->coupon_code,
+            completedAt: self::now(),
+        );
+
+        return Outbox::record(CompletedV1::TYPE, $checkout->id, $event->toArray(), CompletedV1::SCHEMA);
     }
 
     public static function failed(Checkout $checkout): Envelope

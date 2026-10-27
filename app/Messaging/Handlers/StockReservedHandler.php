@@ -8,6 +8,7 @@ use App\Messaging\Reply;
 use App\Models\Checkout;
 use App\Saga\CheckoutSaga;
 use Illuminate\Support\Carbon;
+use Shopwise\Contracts\Events\Inventory\StockReservedV1;
 use Shopwise\Kit\Messaging\Envelope;
 use Shopwise\Kit\Messaging\MessageHandler;
 
@@ -20,11 +21,11 @@ final readonly class StockReservedHandler implements MessageHandler
 
     public function handle(Envelope $envelope): void
     {
-        $reply = new Reply($envelope);
-        $checkout = $reply->checkout();
+        $reply = StockReservedV1::fromArray($envelope->data);
+        $checkout = Reply::checkout($reply->checkoutId, $envelope);
 
         if ($checkout instanceof Checkout) {
-            $this->saga->stockReserved($checkout, $envelope, $reply->string('reservationId'), Carbon::parse($reply->string('expiresAt')));
+            $this->saga->stockReserved($checkout, $envelope, $reply->reservationId, Carbon::parse($reply->expiresAt));
         }
     }
 }

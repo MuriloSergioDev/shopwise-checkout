@@ -7,6 +7,7 @@ namespace App\Messaging\Handlers;
 use App\Messaging\Reply;
 use App\Models\Checkout;
 use App\Saga\CheckoutSaga;
+use Shopwise\Contracts\Events\Inventory\ReservationCommittedV1;
 use Shopwise\Kit\Messaging\Envelope;
 use Shopwise\Kit\Messaging\MessageHandler;
 
@@ -19,7 +20,8 @@ final readonly class ReservationCommittedHandler implements MessageHandler
 
     public function handle(Envelope $envelope): void
     {
-        $checkout = new Reply($envelope)->checkout();
+        $reply = ReservationCommittedV1::fromArray($envelope->data);
+        $checkout = Reply::checkout($reply->checkoutId, $envelope);
 
         if ($checkout instanceof Checkout) {
             $this->saga->reservationCommitted($checkout, $envelope);
